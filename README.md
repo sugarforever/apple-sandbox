@@ -11,27 +11,46 @@ MVP. Verified so far:
 
 - `run` → `ls` → `logs` → `stop` → `rm` lifecycle works end-to-end against
   Apple `container` on this machine.
-- The executor image builds (Node 22 + `@openai/codex@latest`) and its
-  entrypoint runs `codex exec-server`, which itself enforces that `--remote`
-  points at an `openai.com`/`openai.org` host — confirmed by testing against
-  a bogus URL and seeing that exact rejection surface through `logs`.
 - `prune` correctly distinguishes dry-run vs. real removal and respects
   `--older-than`, tested against a real stopped session (verified via
   `container inspect`'s `startedDate`, which is a Cocoa reference-date
   timestamp — seconds since 2001-01-01T00:00:00Z, not Unix epoch).
+- **Tested against a real, live Agents API session** (real `POST
+  /v1/agents/sessions` call, real `environment.id` / `remote_url`). Two real
+  bugs surfaced this way that no amount of reading docs would have caught:
+  - The executor image (`node:22-slim`) shipped without a usable CA trust
+    store, so outbound TLS to `api.openai.com` failed with "unable to get
+    local issuer certificate." Fixed by installing `ca-certificates` in the
+    [Dockerfile](image/executor/Dockerfile).
+  - `session.environment.remote_url` is an `https://api.openai.com/...`
+    URL, not `wss://codex-cloud-environments.chatgpt.com` as earlier
+    research assumed — `codex exec-server` connected to it fine once TLS was
+    fixed. (Whether `codex-cloud-environments.chatgpt.com` is still used for
+    anything *after* registration is unconfirmed either way — see
+    [Known gaps](#known-gaps-not-in-this-mvp).)
+  - With TLS fixed, registration reached OpenAI and failed with a real,
+    correctly-formed error: `403 Forbidden: missing required scope
+    api.agents.environments.connect`. This is the server actually enforcing
+    the scope requirement described in
+    [Integrating with the OpenAI Agents API](#integrating-with-the-openai-agents-api) —
+    a regular project `OPENAI_API_KEY` doesn't have it, only a purpose-made
+    restricted key does.
 
-Not yet verified: a real end-to-end run against a live Agents API session
-(needs real `environment-id` / `remote-url` / restricted `CODEX_API_KEY`
-from your own app's session-creation call).
+Not yet verified: a full round trip — submitting a task, the executor
+actually running it, and a result file appearing in the workspace — because
+that needs a real `api.agents.environments.connect`-scoped key, which is
+created by hand in the OpenAI Platform UI, not something tested so far.
 
 ### Known gaps (not in this MVP)
 
 - **No egress allowlisting.** Apple `container` networks only support
   `--internal` (host-only) or open egress — there's no domain allowlist
   primitive. This sandbox currently gives the executor full outbound network
-  access rather than restricting it to `api.openai.com` /
-  `codex-cloud-environments.chatgpt.com`. Don't use this for untrusted
-  workloads until a proxy/allowlist layer is added.
+  access rather than restricting it to the hosts it actually needs — confirmed
+  so far to include `api.openai.com` (real registration traffic observed
+  going there); whether anything else is needed post-registration is still
+  unconfirmed. Don't use this for untrusted workloads until a proxy/allowlist
+  layer is added.
 - **No daemon / SDK.** This is CLI-only for now; a TS/Python SDK would just
   wrap these same subprocess calls.
 - **`prune` uses a heuristic for session age, not ground truth.** It reads
@@ -43,11 +62,11 @@ from your own app's session-creation call).
   [Integrating with the OpenAI Agents API](#integrating-with-the-openai-agents-api)
   for why this — rather than a webhook receiver — is the right amount of
   automation for this CLI's provisioning mode.
-- **`CODEX_API_KEY` as the container env var is now corroborated** by
-  Cloudflare's own reference integration (independent of the earlier
-  research this project started from), though still not tested end-to-end
-  against a live session on Apple `container` specifically. See the comment
-  in [`image/executor/entrypoint.sh`](image/executor/entrypoint.sh).
+- **`CODEX_API_KEY` as the container env var is confirmed** — a real
+  `codex exec-server` run picked it up and used it to attempt registration
+  (it got as far as a real 403 from OpenAI over the scope, not an "unset
+  env var" error). See the comment in
+  [`image/executor/entrypoint.sh`](image/executor/entrypoint.sh).
 
 ## Prerequisites
 
@@ -88,25 +107,21 @@ The clearest worked example of the whole flow today is Cloudflare's own
 it targets Cloudflare Containers rather than Apple `container`, but the
 Agents API side (session creation, webhook events, key scopes) is identical.
 
-### 1. Create an agent (once, not per session)
+### 1. Create a self-hosted session
 
-```bash
-curl https://api.openai.com/v1/agents \
-  --request POST \
-  --header "OpenAI-Beta: agents=v1" \
-  --header "Authorization: Bearer $OPENAI_API_KEY" \
-  --json '{"name": "apple-sandbox-demo", "model": "<model>"}'
-```
-
-### 2. Create a self-hosted session
+The agent is created inline with the session, in one call — not as a
+separate `POST /v1/agents` step referenced by `agent_id`. (An earlier
+version of this doc showed a two-step flow; this one-step shape is what a
+real `201` response actually confirmed.)
 
 ```bash
 curl https://api.openai.com/v1/agents/sessions \
   --request POST \
   --header "OpenAI-Beta: agents=v1" \
   --header "Authorization: Bearer $OPENAI_API_KEY" \
-  --json '{
-    "agent_id": "'"$AGENT_ID"'",
+  --header "Content-Type: application/json" \
+  --data '{
+    "agent": {"model": "<model>", "instructions": "<instructions>"},
     "environment": {"type": "self_hosted", "workspace_directory": "/workspace"}
   }'
 ```
@@ -114,8 +129,11 @@ curl https://api.openai.com/v1/agents/sessions \
 The response carries the session id (`sess_...`) plus the environment's `id`
 and `remote_url` — these are exactly the `--environment-id` and
 `--remote-url` values `apple-sandbox run` expects below.
+`remote_url` is an `https://api.openai.com/v1/agents/api/connect/...` URL
+(confirmed from a real response) — not the `wss://codex-cloud-environments.chatgpt.com`
+host cited in earlier research; pass it through unchanged either way.
 
-### 3. Issue a restricted executor key
+### 2. Issue a restricted executor key
 
 From the OpenAI Platform, create a key scoped to exactly:
 
@@ -123,15 +141,18 @@ From the OpenAI Platform, create a key scoped to exactly:
 - `api.agents.environments.connect`
 
 Nothing else. This becomes `--executor-key` — the container's `CODEX_API_KEY`
-— and must never be your app's own `OPENAI_API_KEY`.
+— and must never be your app's own `OPENAI_API_KEY`. This isn't a
+recommendation to be careful with, it's an enforced check: registering with
+a regular project `OPENAI_API_KEY` gets a real `403 Forbidden: missing
+required scope api.agents.environments.connect` from OpenAI.
 
-### 4. Start the sandbox, then drive the session normally
+### 3. Start the sandbox, then drive the session normally
 
 ```bash
 apple-sandbox run \
-  --environment-id <environment.id from step 2> \
-  --remote-url <environment.remote_url from step 2> \
-  --executor-key <restricted key from step 3>
+  --environment-id <environment.id from step 1> \
+  --remote-url <environment.remote_url from step 1> \
+  --executor-key <restricted key from step 2>
 ```
 
 Session input goes through the Agents API itself, not through this CLI:
@@ -286,10 +307,11 @@ Two things worth noting from that diagram:
   `apple-sandbox` is invisible to them. It only exists to do step 5 (start
   the VM) and step 6 (launch the executor inside it) correctly, then get out
   of the way while 7–12 run over the executor's own outbound WebSocket.
-- **Step 7 is the only network requirement**: the VM needs outbound access
-  to `https://api.openai.com` and `wss://codex-cloud-environments.chatgpt.com`.
-  As noted in [Known gaps](#known-gaps-not-in-this-mvp), this sandbox doesn't
-  yet restrict egress to just those two hosts.
+- **Step 7 is the network requirement to lock down**: `api.openai.com` is
+  confirmed (real registration traffic observed going there); whether
+  anything else is needed post-registration is still unconfirmed, see
+  [Status](#status). As noted in [Known gaps](#known-gaps-not-in-this-mvp),
+  this sandbox doesn't yet restrict egress to just what's needed.
 
 ### Session lifecycle
 

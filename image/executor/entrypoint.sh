@@ -6,11 +6,11 @@
 #   OPENAI_ENVIRONMENT_ID  session.environment.id from the Agents API
 #   OPENAI_REMOTE_URL      session.environment.remote_url from the Agents API
 #
-# NOTE: CODEX_API_KEY as the container env var is corroborated by both
-# OpenAI's self-hosted sandboxes guide and Cloudflare's independent reference
-# integration (https://developers.cloudflare.com/sandbox/tutorials/openai-agents-api/),
-# but has not yet been verified end-to-end against a live Agents API session
-# on Apple `container` specifically.
+# NOTE: confirmed against a real Agents API session — codex exec-server
+# picked up CODEX_API_KEY and reached OpenAI's real registration endpoint,
+# failing on a real 403 (missing scope) rather than a missing-env-var error.
+# Full task execution still unverified; a properly-scoped key is needed for
+# that. See the README's Status section.
 set -eu
 
 : "${CODEX_API_KEY:?CODEX_API_KEY is required}"
