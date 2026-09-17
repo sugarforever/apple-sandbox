@@ -6,8 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
+	executorimage "github.com/sugarforever/apple-sandbox/image/executor"
 	"github.com/sugarforever/apple-sandbox/internal/containercli"
 	"github.com/sugarforever/apple-sandbox/internal/doctor"
 	"github.com/sugarforever/apple-sandbox/internal/sandbox"
@@ -98,12 +100,51 @@ func runDoctor() error {
 func runBuild(args []string) error {
 	fs := flag.NewFlagSet("build", flag.ExitOnError)
 	tag := fs.String("tag", defaultImage, "image tag to build")
-	dir := fs.String("context", "image/executor", "build context directory")
+	contextDir := fs.String("context", "", "build context directory (default: the Dockerfile embedded in this binary — no repo checkout needed)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "building %s from %s ...\n", *tag, *dir)
-	return containercli.Build(*tag, "", *dir)
+
+	dir := *contextDir
+	if dir == "" {
+		tmpDir, err := writeEmbeddedExecutorContext()
+		if err != nil {
+			return fmt.Errorf("extracting embedded executor Dockerfile: %w", err)
+		}
+		defer os.RemoveAll(tmpDir)
+		dir = tmpDir
+	}
+
+	fmt.Fprintf(os.Stderr, "building %s from %s ...\n", *tag, dir)
+	return containercli.Build(*tag, "", dir)
+}
+
+// writeEmbeddedExecutorContext materializes the Dockerfile and entrypoint.sh
+// embedded in this binary (image/executor/embed.go) into a temp directory,
+// so `container build` has a real context dir to point at even when this
+// binary was downloaded standalone, with no repo checkout alongside it.
+func writeEmbeddedExecutorContext() (string, error) {
+	tmpDir, err := os.MkdirTemp("", "apple-sandbox-executor-*")
+	if err != nil {
+		return "", err
+	}
+	entries, err := executorimage.Files.ReadDir(".")
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		return "", err
+	}
+	for _, entry := range entries {
+		data, err := executorimage.Files.ReadFile(entry.Name())
+		if err != nil {
+			os.RemoveAll(tmpDir)
+			return "", err
+		}
+		if err := os.WriteFile(filepath.Join(tmpDir, entry.Name()), data, 0o644); err != nil {
+			os.RemoveAll(tmpDir)
+			return "", err
+		}
+	}
+	return tmpDir, nil
 }
 
 func runRun(args []string) error {
