@@ -293,6 +293,115 @@ Each session's `/workspace` is a bind mount of
 `./sandboxes/<session-id>/` on the host — that host directory is the durable
 state; the container itself is disposable (`rm` after `stop`).
 
+## Worked example: a CSV summary, start to finish
+
+This is the actual sequence that produced the result below — a real
+session, a real `apple-sandbox run`, a real output file — not a
+hypothetical. IDs are redacted (`<...>`); everything else is copy-pasteable.
+See [Status](#status) for what broke the first two times this was run.
+
+### 1. Create the session
+
+```bash
+export OPENAI_API_KEY=<your app's regular key>
+
+curl https://api.openai.com/v1/agents/sessions \
+  --request POST \
+  --header "OpenAI-Beta: agents=v1" \
+  --header "Authorization: Bearer $OPENAI_API_KEY" \
+  --header "Content-Type: application/json" \
+  --data '{
+    "agent": {
+      "model": "gpt-6-astra",
+      "instructions": "You are a careful coding assistant. Work in /workspace, show the commands you run, and verify generated files before finishing."
+    },
+    "environment": {"type": "self_hosted", "workspace_directory": "/workspace"}
+  }' | tee session.json
+```
+
+Real response shape (`201`):
+
+```json
+{
+  "id": "sess_<...>",
+  "status": "idle",
+  "environment": {
+    "type": "self_hosted",
+    "id": "ccarenv_<...>",
+    "remote_url": "https://api.openai.com/v1/agents/api/connect/<...>",
+    "workspace_directory": "/workspace"
+  }
+}
+```
+
+### 2. Start the sandbox
+
+```bash
+export OPENAI_EXECUTOR_API_KEY=<key scoped to api.model.read + api.agents.environments.connect>
+SESSION_ID=$(python3 -c 'import json;print(json.load(open("session.json"))["id"])')
+ENV_ID=$(python3 -c 'import json;print(json.load(open("session.json"))["environment"]["id"])')
+REMOTE_URL=$(python3 -c 'import json;print(json.load(open("session.json"))["environment"]["remote_url"])')
+
+apple-sandbox build   # once, builds the Node + codex executor image
+apple-sandbox run --session-id csvdemo --environment-id "$ENV_ID" --remote-url "$REMOTE_URL"
+apple-sandbox ls      # STATUS should read `running` — if it's `stopped`, `apple-sandbox logs csvdemo` has the reason
+```
+
+### 3. Drop the input file in — no upload API involved
+
+```bash
+cat > sandboxes/csvdemo/amounts.csv << 'EOF'
+item,amount
+alpha,10
+beta,20
+gamma,30
+delta,15
+EOF
+```
+
+### 4. Submit the task
+
+```bash
+curl https://api.openai.com/v1/agents/sessions/$SESSION_ID/events \
+  --request POST \
+  --header "OpenAI-Beta: agents=v1" \
+  --header "Authorization: Bearer $OPENAI_API_KEY" \
+  --header "Content-Type: application/json" \
+  --data '{"events": [{"type": "agent.session.input.message",
+    "input": [{"role": "user", "content": [{"type": "input_text",
+      "text": "Use Python to read /workspace/amounts.csv. Validate that the amount column is numeric, calculate the row count and total, and write exactly this JSON shape to /workspace/outputs/summary.json: {\"rows\": number, \"total\": number, \"verified\": true}. Read the file back, verify it, and report the result and output path."}]}]}]}'
+```
+
+Real response: `202 Accepted`. Session status goes `idle → in_progress` —
+confirm with `curl .../v1/agents/sessions/$SESSION_ID` if curious.
+
+### 5. Wait, then read the result straight off disk
+
+```bash
+sleep 10
+cat sandboxes/csvdemo/outputs/summary.json
+```
+
+```json
+{"rows": 4, "total": 75, "verified": true}
+```
+
+That's the actual output from the actual run — no artifact download call,
+no polling an OpenAI endpoint for the file. It's Python, executed over the
+executor's WebSocket connection inside the VM, writing into the same
+`./sandboxes/csvdemo/` directory this file had been sitting in the whole
+time.
+
+### 6. Clean up
+
+```bash
+apple-sandbox stop csvdemo
+apple-sandbox rm csvdemo
+curl --request DELETE https://api.openai.com/v1/agents/sessions/$SESSION_ID \
+  --header "OpenAI-Beta: agents=v1" \
+  --header "Authorization: Bearer $OPENAI_API_KEY"
+```
+
 ## How it works
 
 `apple-sandbox` only ever plays one role in this flow: turning an
