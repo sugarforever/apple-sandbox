@@ -5,98 +5,24 @@ A no-daemon CLI that runs OpenAI Agents API [self-hosted executors](https://deve
 as the runtime. Each sandbox session is one OCI container = one lightweight
 Virtualization.framework VM.
 
-## Status
-
-MVP, but **the full round trip is verified against a real, live Agents API
-session** — not just the local container lifecycle:
-
-- `run` → `ls` → `logs` → `stop` → `rm` lifecycle works end-to-end against
-  Apple `container` on this machine.
-- `prune` correctly distinguishes dry-run vs. real removal and respects
-  `--older-than`, tested against a real stopped session (verified via
-  `container inspect`'s `startedDate`, which is a Cocoa reference-date
-  timestamp — seconds since 2001-01-01T00:00:00Z, not Unix epoch).
-- **End-to-end CSV task, run for real**: created a real self-hosted session
-  (`POST /v1/agents/sessions`), started `apple-sandbox run` with a properly
-  `api.agents.environments.connect`-scoped key, dropped a CSV into the
-  bind-mounted workspace, submitted "analyze this CSV and write summary
-  stats to `/workspace/outputs/summary.json`" via the Agents API, and the
-  file showed up in `./sandboxes/<session-id>/outputs/summary.json` on the
-  host — `{"rows": 4, "total": 75, "verified": true}`, matching the agent's
-  own reported output exactly. Session went `idle → in_progress → idle`;
-  torn down cleanly afterward (`apple-sandbox stop/rm` + `DELETE
-  /v1/agents/sessions/{id}`).
-- That first successful run followed two failed attempts that each surfaced
-  a real, previously-undocumented bug:
-  - The executor image (`node:22-slim`) shipped without a usable CA trust
-    store, so outbound TLS to `api.openai.com` failed with "unable to get
-    local issuer certificate." Fixed by installing `ca-certificates` in the
-    [Dockerfile](image/executor/Dockerfile).
-  - The Agents API event type for submitting input is
-    `agent.session.input.message`, not `session.input.message` as earlier
-    research (and an earlier version of this README) had it — confirmed by
-    a real `400 invalid_request_error` naming the three actually-supported
-    values.
-  - `session.environment.remote_url` is an `https://api.openai.com/...`
-    URL, not `wss://codex-cloud-environments.chatgpt.com` as earlier
-    research assumed. Whether `codex-cloud-environments.chatgpt.com` is used
-    for anything else is still unconfirmed — see
-    [Known gaps](#known-gaps-not-in-this-mvp).
-  - A regular project `OPENAI_API_KEY` used as the executor key fails
-    registration with a real `403 Forbidden: missing required scope
-    api.agents.environments.connect` — the scope requirement in
-    [Integrating with the OpenAI Agents API](#integrating-with-the-openai-agents-api)
-    is server-enforced, not just documented practice.
-  - The bind mount is confirmed live/real-time in both directions: a file
-    written on the host with a plain `cat >` appeared instantly via
-    `container exec ... cat /workspace/...`, no restart needed.
-- **The `v0.1.1` release itself was re-verified the way an actual user would
-  use it**: `curl`-installed via the exact command in
-  [Install](#install) into `~/.local/bin` (no `sudo`, no repo checkout),
-  then `doctor` / `build` / `run` / the full CSV round trip all run from an
-  empty directory. This caught a real bug that shipped in `v0.1.0`:
-  `apple-sandbox build` defaulted to a relative `image/executor` path that
-  only exists inside a repo checkout, so a binary-only install couldn't
-  build the image at all. Fixed in `v0.1.1` by embedding the Dockerfile and
-  entrypoint script into the binary via `go:embed`.
-- **One real data point on task reliability, not glossed over**: re-running
-  the exact same CSV task against `v0.1.1` succeeded on the *second*
-  submission, not the first — the first turn consumed real tokens (per the
-  session's `usage` field) but wrote no output file, for reasons outside
-  apple-sandbox's visibility (the container stayed `running`/connected the
-  whole time; nothing here crashed or reconnected). Resubmitting the same
-  input to the same still-open session produced the correct file on the
-  next turn. Not yet enough runs to know how often this happens.
-
-### Known gaps (not in this MVP)
-
-- **No egress allowlisting.** Apple `container` networks only support
-  `--internal` (host-only) or open egress — there's no domain allowlist
-  primitive. This sandbox currently gives the executor full outbound network
-  access rather than restricting it to the hosts it actually needs — confirmed
-  so far to include `api.openai.com` (real registration traffic observed
-  going there); whether anything else is needed post-registration is still
-  unconfirmed. Don't use this for untrusted workloads until a proxy/allowlist
-  layer is added.
-- **No daemon / SDK.** This is CLI-only for now; a TS/Python SDK would just
-  wrap these same subprocess calls.
-- **`prune` uses a heuristic for session age, not ground truth.** It reads
-  each stopped container's start time from `container inspect` — there's no
-  API call back to OpenAI to confirm the session actually ended. In practice
-  this is safe: the executor only reaches "stopped" once OpenAI permanently
-  closes its connection (it reconnects on transient drops), so a stopped
-  container already means the session is over. See
-  [Integrating with the OpenAI Agents API](#integrating-with-the-openai-agents-api)
-  for why this — rather than a webhook receiver — is the right amount of
-  automation for this CLI's provisioning mode.
+> Don't point this at untrusted input yet — the sandbox's outbound network
+> isn't restricted to just OpenAI's hosts. See
+> [Known gaps](#known-gaps-not-in-this-mvp) before relying on it for
+> anything beyond your own trusted tasks.
 
 ## Prerequisites
 
 - Apple Silicon Mac, macOS with Apple `container` installed
   (`brew install --cask container`) and its services started
   (`container system start`).
+- An OpenAI account with Agents API access and an `OPENAI_API_KEY` — get one
+  at [platform.openai.com/api-keys](https://platform.openai.com/api-keys) if
+  you don't have one. You'll also create a second, more restricted key later
+  (see [Integrating](#integrating-with-the-openai-agents-api)); the account
+  is the only prerequisite for both.
 
-Run `apple-sandbox doctor` to check all of the above plus free disk space.
+Run `apple-sandbox doctor` (after installing below) to check all of the
+above plus free disk space.
 
 ## Install
 
@@ -125,6 +51,16 @@ Or build from source (needs Go 1.27+):
 ```bash
 go build -o bin/apple-sandbox ./cmd/apple-sandbox
 ```
+
+Verify the install, and check the rest of the environment while you're at
+it:
+
+```bash
+apple-sandbox doctor
+```
+
+Every check should read `PASS`. If `container system services` fails, run
+`container system start` and try again.
 
 ## Integrating with the OpenAI Agents API
 
@@ -192,7 +128,8 @@ apple-sandbox run \
 
 Session input goes through the Agents API itself, not through this CLI —
 this exact call, `agent.session.input.message` included, is what actually
-worked in the CSV test above (`session.input.message` gets a `400`):
+worked in the [worked example](#worked-example-a-csv-summary-start-to-finish)
+below (`session.input.message` gets a `400`):
 
 ```bash
 curl https://api.openai.com/v1/agents/sessions/$SESSION_ID/events \
@@ -217,72 +154,6 @@ the schema level, it's not just undocumented. (Output artifacts are
 similarly hosted-only: self-hosted artifacts are explicitly *not* published
 through OpenAI's Artifacts API. See the
 [self-hosted sandboxes guide](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted).)
-
-### Provisioning modes: this CLI is "application-managed," on purpose
-
-OpenAI's own self-hosted sandboxes docs describe **two equally first-class
-ways** to provision the executor — every provider guide checked (Cloudflare,
-Vercel, Modal) documents both as a deliberate choice, not a fallback:
-
-| Mode | How it starts the executor | Needs a public URL? |
-|---|---|---|
-| **Application-managed** | Your app starts compute itself, synchronously, right when it creates the session | No |
-| **Webhook-managed** | OpenAI pushes `agent.session.*` events to a handler you deploy, which starts/reconnects compute on demand | Yes — OpenAI has to reach your endpoint |
-
-`apple-sandbox` implements the left column — see the full sequence in
-[How it works](#how-it-works) below. The right column is what you'd build
-*instead*, not something this CLI is missing; shown here only for contrast,
-since it's the shape of Cloudflare's/Vercel's/Modal's reference
-implementations:
-
-```mermaid
-sequenceDiagram
-    actor App as Your app
-    participant Agents as OpenAI Agents API
-    participant Hook as Your webhook handler<br/>(public URL — not part of this CLI)
-    participant VM as Sandbox VM
-
-    App->>Agents: Create session (environment.type = self_hosted)
-    Note over Agents,Hook: OpenAI now decides when compute starts
-    Agents->>Hook: agent.session.created
-    Hook->>VM: Prewarm (e.g. pull image)
-    Agents->>Hook: agent.session.action_required
-    Hook->>Hook: Confirm ownership,<br/>read environment.id / remote_url
-    Hook->>VM: Start executor (container run + codex exec-server)
-    Agents->>Hook: agent.session.idle
-    Hook->>VM: Snapshot if supported, arm shutdown deadline
-    Agents->>Hook: agent.session.failed
-    Hook->>VM: Stop + clean up
-```
-
-`apple-sandbox run` is a straightforward implementation of **application-managed**
-provisioning: your app creates the session, gets `environment.id` /
-`remote_url` back, and calls `apple-sandbox run` right then. That's the
-officially-supported pattern, not a workaround standing in for the "real"
-webhook approach — webhook-managed exists for a different problem (start
-compute only when OpenAI actually needs it, at scale) that a single-developer
-CLI on a personal Mac doesn't have.
-
-**Connections are outbound-only either way.** The executor initiates the
-WebSocket to OpenAI and reconnects on drops; OpenAI never calls into your
-machine for the actual command/result exchange. A public URL is *only*
-needed if you additionally choose webhook-managed provisioning.
-
-What application-managed mode does still leave to you: noticing when a
-session is over and tearing the container down. `apple-sandbox` doesn't poll
-OpenAI's API for this — it doesn't need to. The executor process itself
-exits once OpenAI closes the connection for good (as opposed to a transient
-drop, which it reconnects through), which leaves the container in `stopped`
-state. `apple-sandbox prune --older-than 1h` (or any TTL) then cleans those
-up — run it by hand, or on a schedule via `launchd`/`cron`:
-
-```bash
-apple-sandbox prune --older-than 1h        # remove
-apple-sandbox prune --older-than 1h --dry-run   # preview first
-```
-
-`prune` never touches running containers — only ones Apple `container`
-itself already reports as `stopped`.
 
 ## Usage
 
@@ -406,7 +277,9 @@ curl https://api.openai.com/v1/agents/sessions/$SESSION_ID/events \
 ```
 
 Real response: `202 Accepted`. Session status goes `idle → in_progress` —
-confirm with `curl .../v1/agents/sessions/$SESSION_ID` if curious.
+confirm with `curl .../v1/agents/sessions/$SESSION_ID` if curious. If it's
+still `in_progress` after a while, that's normal — give it up to a minute
+before assuming something's wrong.
 
 ### 5. Wait, then read the result straight off disk
 
@@ -424,6 +297,11 @@ no polling an OpenAI endpoint for the file. It's Python, executed over the
 executor's WebSocket connection inside the VM, writing into the same
 `./sandboxes/csvdemo/` directory this file had been sitting in the whole
 time.
+
+If `outputs/summary.json` doesn't show up: check `curl .../v1/agents/sessions/$SESSION_ID`
+for the session's status. If it already went back to `idle` with no file,
+resubmit the same input from step 4 — see [Status](#status) for why that's
+sometimes necessary.
 
 ### 6. Clean up
 
@@ -483,6 +361,71 @@ Two things worth noting from that diagram:
   [Status](#status). As noted in [Known gaps](#known-gaps-not-in-this-mvp),
   this sandbox doesn't yet restrict egress to just what's needed.
 
+### Provisioning modes: this CLI is "application-managed," on purpose
+
+OpenAI's own self-hosted sandboxes docs describe **two equally first-class
+ways** to provision the executor — every provider guide checked (Cloudflare,
+Vercel, Modal) documents both as a deliberate choice, not a fallback:
+
+| Mode | How it starts the executor | Needs a public URL? |
+|---|---|---|
+| **Application-managed** | Your app starts compute itself, synchronously, right when it creates the session | No |
+| **Webhook-managed** | OpenAI pushes `agent.session.*` events to a handler you deploy, which starts/reconnects compute on demand | Yes — OpenAI has to reach your endpoint |
+
+`apple-sandbox` implements the left column — the full sequence is the
+diagram above. The right column is what you'd build *instead*, not
+something this CLI is missing; shown here only for contrast, since it's the
+shape of Cloudflare's/Vercel's/Modal's reference implementations:
+
+```mermaid
+sequenceDiagram
+    actor App as Your app
+    participant Agents as OpenAI Agents API
+    participant Hook as Your webhook handler<br/>(public URL — not part of this CLI)
+    participant VM as Sandbox VM
+
+    App->>Agents: Create session (environment.type = self_hosted)
+    Note over Agents,Hook: OpenAI now decides when compute starts
+    Agents->>Hook: agent.session.created
+    Hook->>VM: Prewarm (e.g. pull image)
+    Agents->>Hook: agent.session.action_required
+    Hook->>Hook: Confirm ownership,<br/>read environment.id / remote_url
+    Hook->>VM: Start executor (container run + codex exec-server)
+    Agents->>Hook: agent.session.idle
+    Hook->>VM: Snapshot if supported, arm shutdown deadline
+    Agents->>Hook: agent.session.failed
+    Hook->>VM: Stop + clean up
+```
+
+`apple-sandbox run` is a straightforward implementation of **application-managed**
+provisioning: your app creates the session, gets `environment.id` /
+`remote_url` back, and calls `apple-sandbox run` right then. That's the
+officially-supported pattern, not a workaround standing in for the "real"
+webhook approach — webhook-managed exists for a different problem (start
+compute only when OpenAI actually needs it, at scale) that a single-developer
+CLI on a personal Mac doesn't have.
+
+**Connections are outbound-only either way.** The executor initiates the
+WebSocket to OpenAI and reconnects on drops; OpenAI never calls into your
+machine for the actual command/result exchange. A public URL is *only*
+needed if you additionally choose webhook-managed provisioning.
+
+What application-managed mode does still leave to you: noticing when a
+session is over and tearing the container down. `apple-sandbox` doesn't poll
+OpenAI's API for this — it doesn't need to. The executor process itself
+exits once OpenAI closes the connection for good (as opposed to a transient
+drop, which it reconnects through), which leaves the container in `stopped`
+state. `apple-sandbox prune --older-than 1h` (or any TTL) then cleans those
+up — run it by hand, or on a schedule via `launchd`/`cron`:
+
+```bash
+apple-sandbox prune --older-than 1h        # remove
+apple-sandbox prune --older-than 1h --dry-run   # preview first
+```
+
+`prune` never touches running containers — only ones Apple `container`
+itself already reports as `stopped`.
+
 ### Session lifecycle
 
 The states the sandbox itself moves through. Two paths are now confirmed
@@ -540,6 +483,91 @@ apple-sandbox run
 No daemon, no control-plane process: `apple-sandbox` shells out to the
 `container` CLI directly, and the container survives (not `--rm`) after
 stopping so `logs` remains available for debugging a crashed executor.
+
+## Status
+
+MVP, but **the full round trip is verified against a real, live Agents API
+session** — not just the local container lifecycle:
+
+- `run` → `ls` → `logs` → `stop` → `rm` lifecycle works end-to-end against
+  Apple `container` on this machine.
+- `prune` correctly distinguishes dry-run vs. real removal and respects
+  `--older-than`, tested against a real stopped session (verified via
+  `container inspect`'s `startedDate`, which is a Cocoa reference-date
+  timestamp — seconds since 2001-01-01T00:00:00Z, not Unix epoch).
+- **End-to-end CSV task, run for real**: created a real self-hosted session
+  (`POST /v1/agents/sessions`), started `apple-sandbox run` with a properly
+  `api.agents.environments.connect`-scoped key, dropped a CSV into the
+  bind-mounted workspace, submitted "analyze this CSV and write summary
+  stats to `/workspace/outputs/summary.json`" via the Agents API, and the
+  file showed up in `./sandboxes/<session-id>/outputs/summary.json` on the
+  host — `{"rows": 4, "total": 75, "verified": true}`, matching the agent's
+  own reported output exactly. Session went `idle → in_progress → idle`;
+  torn down cleanly afterward (`apple-sandbox stop/rm` + `DELETE
+  /v1/agents/sessions/{id}`).
+- That first successful run followed two failed attempts that each surfaced
+  a real, previously-undocumented bug:
+  - The executor image (`node:22-slim`) shipped without a usable CA trust
+    store, so outbound TLS to `api.openai.com` failed with "unable to get
+    local issuer certificate." Fixed by installing `ca-certificates` in the
+    [Dockerfile](image/executor/Dockerfile).
+  - The Agents API event type for submitting input is
+    `agent.session.input.message`, not `session.input.message` as earlier
+    research (and an earlier version of this README) had it — confirmed by
+    a real `400 invalid_request_error` naming the three actually-supported
+    values.
+  - `session.environment.remote_url` is an `https://api.openai.com/...`
+    URL, not `wss://codex-cloud-environments.chatgpt.com` as earlier
+    research assumed. Whether `codex-cloud-environments.chatgpt.com` is used
+    for anything else is still unconfirmed — see
+    [Known gaps](#known-gaps-not-in-this-mvp).
+  - A regular project `OPENAI_API_KEY` used as the executor key fails
+    registration with a real `403 Forbidden: missing required scope
+    api.agents.environments.connect` — the scope requirement in
+    [Integrating with the OpenAI Agents API](#integrating-with-the-openai-agents-api)
+    is server-enforced, not just documented practice.
+  - The bind mount is confirmed live/real-time in both directions: a file
+    written on the host with a plain `cat >` appeared instantly via
+    `container exec ... cat /workspace/...`, no restart needed.
+- **The `v0.1.1` release itself was re-verified the way an actual user would
+  use it**: `curl`-installed via the exact command in
+  [Install](#install) into `~/.local/bin` (no `sudo`, no repo checkout),
+  then `doctor` / `build` / `run` / the full CSV round trip all run from an
+  empty directory. This caught a real bug that shipped in `v0.1.0`:
+  `apple-sandbox build` defaulted to a relative `image/executor` path that
+  only exists inside a repo checkout, so a binary-only install couldn't
+  build the image at all. Fixed in `v0.1.1` by embedding the Dockerfile and
+  entrypoint script into the binary via `go:embed`.
+- **One real data point on task reliability, not glossed over**: re-running
+  the exact same CSV task against `v0.1.1` succeeded on the *second*
+  submission, not the first — the first turn consumed real tokens (per the
+  session's `usage` field) but wrote no output file, for reasons outside
+  apple-sandbox's visibility (the container stayed `running`/connected the
+  whole time; nothing here crashed or reconnected). Resubmitting the same
+  input to the same still-open session produced the correct file on the
+  next turn. Not yet enough runs to know how often this happens.
+
+### Known gaps (not in this MVP)
+
+- **No egress allowlisting.** Apple `container` networks only support
+  `--internal` (host-only) or open egress — there's no domain allowlist
+  primitive. This sandbox currently gives the executor full outbound network
+  access rather than restricting it to the hosts it actually needs — confirmed
+  so far to include `api.openai.com` (real registration traffic observed
+  going there); whether anything else is needed post-registration is still
+  unconfirmed. Don't use this for untrusted workloads until a proxy/allowlist
+  layer is added.
+- **No daemon / SDK.** This is CLI-only for now; a TS/Python SDK would just
+  wrap these same subprocess calls.
+- **`prune` uses a heuristic for session age, not ground truth.** It reads
+  each stopped container's start time from `container inspect` — there's no
+  API call back to OpenAI to confirm the session actually ended. In practice
+  this is safe: the executor only reaches "stopped" once OpenAI permanently
+  closes its connection (it reconnects on transient drops), so a stopped
+  container already means the session is over. See
+  [Integrating with the OpenAI Agents API](#integrating-with-the-openai-agents-api)
+  for why this — rather than a webhook receiver — is the right amount of
+  automation for this CLI's provisioning mode.
 
 ## Releasing
 
