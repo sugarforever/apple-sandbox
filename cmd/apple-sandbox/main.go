@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/sugarforever/apple-sandbox/internal/containercli"
 	"github.com/sugarforever/apple-sandbox/internal/doctor"
@@ -43,6 +44,8 @@ func main() {
 		err = runStop(os.Args[2:])
 	case "rm":
 		err = runRm(os.Args[2:])
+	case "prune":
+		err = runPrune(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Printf("apple-sandbox %s (commit %s, built %s)\n", version, commit, date)
 		return
@@ -72,6 +75,7 @@ Usage:
   apple-sandbox ls                         List sandbox sessions
   apple-sandbox stop <session-id>          Stop a session
   apple-sandbox rm <session-id>            Force-remove a session
+  apple-sandbox prune [flags]              Remove stopped sessions older than a TTL
   apple-sandbox version                    Print version info
 `)
 }
@@ -189,4 +193,33 @@ func runRm(args []string) error {
 		return fmt.Errorf("usage: apple-sandbox rm <session-id>")
 	}
 	return containercli.Delete(sandbox.ContainerName(args[0]), true)
+}
+
+func runPrune(args []string) error {
+	fs := flag.NewFlagSet("prune", flag.ExitOnError)
+	olderThan := fs.Duration("older-than", time.Hour, "remove stopped sessions started more than this long ago")
+	dryRun := fs.Bool("dry-run", false, "show what would be removed without removing it")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	results, err := sandbox.Prune(sandbox.PruneOptions{OlderThan: *olderThan, DryRun: *dryRun})
+	if err != nil {
+		return err
+	}
+	if len(results) == 0 {
+		fmt.Println("no stopped sandbox sessions")
+		return nil
+	}
+	for _, r := range results {
+		switch {
+		case r.Removed && *dryRun:
+			fmt.Printf("would remove %-20s started %s ago\n", r.SessionID, r.Age.Round(time.Second))
+		case r.Removed:
+			fmt.Printf("removed      %-20s started %s ago\n", r.SessionID, r.Age.Round(time.Second))
+		default:
+			fmt.Printf("kept         %-20s %s\n", r.SessionID, r.Kept)
+		}
+	}
+	return nil
 }

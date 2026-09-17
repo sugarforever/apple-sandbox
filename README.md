@@ -15,6 +15,10 @@ MVP. Verified so far:
   entrypoint runs `codex exec-server`, which itself enforces that `--remote`
   points at an `openai.com`/`openai.org` host — confirmed by testing against
   a bogus URL and seeing that exact rejection surface through `logs`.
+- `prune` correctly distinguishes dry-run vs. real removal and respects
+  `--older-than`, tested against a real stopped session (verified via
+  `container inspect`'s `startedDate`, which is a Cocoa reference-date
+  timestamp — seconds since 2001-01-01T00:00:00Z, not Unix epoch).
 
 Not yet verified: a real end-to-end run against a live Agents API session
 (needs real `environment-id` / `remote-url` / restricted `CODEX_API_KEY`
@@ -30,11 +34,15 @@ from your own app's session-creation call).
   workloads until a proxy/allowlist layer is added.
 - **No daemon / SDK.** This is CLI-only for now; a TS/Python SDK would just
   wrap these same subprocess calls.
-- **No webhook-driven lifecycle.** OpenAI drives self-hosted sessions with
-  events (`agent.session.created`, `action_required`, `in_progress`, `idle`,
-  `failed`) that production infra is expected to react to automatically. This
-  CLI is a manual substitute — `run`/`stop`/`rm` by hand — not a reconciler.
-  See [Integrating with the OpenAI Agents API](#integrating-with-the-openai-agents-api).
+- **`prune` uses a heuristic for session age, not ground truth.** It reads
+  each stopped container's start time from `container inspect` — there's no
+  API call back to OpenAI to confirm the session actually ended. In practice
+  this is safe: the executor only reaches "stopped" once OpenAI permanently
+  closes its connection (it reconnects on transient drops), so a stopped
+  container already means the session is over. See
+  [Integrating with the OpenAI Agents API](#integrating-with-the-openai-agents-api)
+  for why this — rather than a webhook receiver — is the right amount of
+  automation for this CLI's provisioning mode.
 - **`CODEX_API_KEY` as the container env var is now corroborated** by
   Cloudflare's own reference integration (independent of the earlier
   research this project started from), though still not tested end-to-end
@@ -137,32 +145,45 @@ curl https://api.openai.com/v1/agents/sessions/$SESSION_ID/events \
     "input": [{"role": "user", "content": [{"type": "input_text", "text": "..."}]}]}]}'
 ```
 
-### What this CLI does not yet automate
+### Provisioning modes: this CLI is "application-managed," on purpose
 
-OpenAI drives self-hosted sessions with webhook events that production
-infrastructure is expected to react to:
+OpenAI's own self-hosted sandboxes docs describe **two equally first-class
+ways** to provision the executor — every provider guide checked (Cloudflare,
+Vercel, Modal) documents both as a deliberate choice, not a fallback:
 
-| Event | Expected reaction |
-|---|---|
-| `agent.session.created` | Prewarm the executor VM |
-| `agent.session.action_required` | Confirm ownership, read `environment.id`/`remote_url`, start or reconnect the executor |
-| `agent.session.in_progress` | Extend the session's lifecycle deadline |
-| `agent.session.idle` | Snapshot the VM if supported, then arm a shutdown deadline |
-| `agent.session.failed` | Stop the container and clear any snapshot |
+| Mode | How it starts the executor | Needs a public URL? |
+|---|---|---|
+| **Application-managed** | Your app starts compute itself, synchronously, right when it creates the session | No |
+| **Webhook-managed** | OpenAI pushes `agent.session.*` events to a handler you deploy, which starts/reconnects compute on demand | Yes — OpenAI has to reach your endpoint |
 
-`apple-sandbox run` / `stop` / `rm` is a manual, imperative substitute for
-that whole reconciliation loop — fine for developing and debugging one
-session at a time, but a real deployment needs a webhook receiver that maps
-these events onto `container` lifecycle calls automatically. Cloudflare's
-reference Worker (one Durable Object per session) is the clearest existing
-example of that state machine; porting the same reconciliation logic onto
-Apple `container` instead of the manual CLI is the natural next step past
-this MVP.
+`apple-sandbox run` is a straightforward implementation of **application-managed**
+provisioning: your app creates the session, gets `environment.id` /
+`remote_url` back, and calls `apple-sandbox run` right then. That's the
+officially-supported pattern, not a workaround standing in for the "real"
+webhook approach — webhook-managed exists for a different problem (start
+compute only when OpenAI actually needs it, at scale) that a single-developer
+CLI on a personal Mac doesn't have.
 
-One more sharp edge from the same source: **deleting an OpenAI session does
-not itself trigger container cleanup** — your infra has to notice via the
-`failed` webhook or a `404` on session lookup and tear the container down
-itself. Today, `apple-sandbox rm` only runs when you run it.
+**Connections are outbound-only either way.** The executor initiates the
+WebSocket to OpenAI and reconnects on drops; OpenAI never calls into your
+machine for the actual command/result exchange. A public URL is *only*
+needed if you additionally choose webhook-managed provisioning.
+
+What application-managed mode does still leave to you: noticing when a
+session is over and tearing the container down. `apple-sandbox` doesn't poll
+OpenAI's API for this — it doesn't need to. The executor process itself
+exits once OpenAI closes the connection for good (as opposed to a transient
+drop, which it reconnects through), which leaves the container in `stopped`
+state. `apple-sandbox prune --older-than 1h` (or any TTL) then cleans those
+up — run it by hand, or on a schedule via `launchd`/`cron`:
+
+```bash
+apple-sandbox prune --older-than 1h        # remove
+apple-sandbox prune --older-than 1h --dry-run   # preview first
+```
+
+`prune` never touches running containers — only ones Apple `container`
+itself already reports as `stopped`.
 
 ## Usage
 
@@ -187,6 +208,10 @@ itself. Today, `apple-sandbox rm` only runs when you run it.
 ./bin/apple-sandbox ls
 ./bin/apple-sandbox stop <session-id>
 ./bin/apple-sandbox rm <session-id>
+
+# 6. Or clean up everything already stopped and old enough, instead of
+#    tracking individual session ids
+./bin/apple-sandbox prune --older-than 1h
 ```
 
 Each session's `/workspace` is a bind mount of
@@ -226,7 +251,7 @@ sequenceDiagram
 
     Harness-->>Agents: 13. Relay outputs / artifacts
     App->>Agents: 14. Poll or stream the session, download artifacts
-    App->>CLI: 15. apple-sandbox logs / stop / rm to inspect or tear down the VM
+    App->>CLI: 15. apple-sandbox logs / stop / rm / prune to inspect or tear down the VM
 ```
 
 Two things worth noting from that diagram:

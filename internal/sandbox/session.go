@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/sugarforever/apple-sandbox/internal/containercli"
 )
@@ -109,4 +110,71 @@ func List() ([]containercli.Container, error) {
 		}
 	}
 	return mine, nil
+}
+
+// PruneOptions configures Prune.
+type PruneOptions struct {
+	OlderThan time.Duration
+	DryRun    bool
+}
+
+// PruneResult reports the outcome for one stopped session.
+type PruneResult struct {
+	SessionID string
+	Age       time.Duration
+	Removed   bool
+	Kept      string // reason, set when Removed is false
+}
+
+// Prune removes stopped sessions older than OlderThan. It never touches
+// running containers.
+//
+// This is local, status-based cleanup — not a substitute for the Agents
+// API's session lifecycle events. It exists because, per OpenAI's own
+// self-hosted sandboxes docs, "application-managed" provisioning (which is
+// what `apple-sandbox run` implements) leaves session teardown to the
+// caller; the executor process exits on its own once OpenAI closes the
+// session for good, which is what leaves the container in "stopped" state
+// for Prune to find.
+func Prune(opts PruneOptions) ([]PruneResult, error) {
+	sessions, err := List()
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	var results []PruneResult
+	for _, s := range sessions {
+		id := s.Configuration.ID[len(NamePrefix):]
+
+		if s.Status != "stopped" {
+			continue
+		}
+
+		info, err := containercli.Inspect(s.Configuration.ID)
+		if err != nil {
+			results = append(results, PruneResult{SessionID: id, Kept: fmt.Sprintf("inspect failed: %v", err)})
+			continue
+		}
+		startedAt := info.StartedAt()
+		if startedAt.IsZero() {
+			results = append(results, PruneResult{SessionID: id, Kept: "no start time reported"})
+			continue
+		}
+
+		age := now.Sub(startedAt)
+		if age < opts.OlderThan {
+			results = append(results, PruneResult{SessionID: id, Age: age, Kept: fmt.Sprintf("started %s ago, younger than %s", age.Round(time.Second), opts.OlderThan)})
+			continue
+		}
+
+		if !opts.DryRun {
+			if err := containercli.Delete(s.Configuration.ID, true); err != nil {
+				results = append(results, PruneResult{SessionID: id, Age: age, Kept: fmt.Sprintf("delete failed: %v", err)})
+				continue
+			}
+		}
+		results = append(results, PruneResult{SessionID: id, Age: age, Removed: true})
+	}
+	return results, nil
 }
