@@ -14,6 +14,13 @@ import (
 
 const defaultImage = "apple-sandbox-executor:latest"
 
+// Set via -ldflags at release build time (see .goreleaser.yml).
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -36,6 +43,9 @@ func main() {
 		err = runStop(os.Args[2:])
 	case "rm":
 		err = runRm(os.Args[2:])
+	case "version", "-v", "--version":
+		fmt.Printf("apple-sandbox %s (commit %s, built %s)\n", version, commit, date)
+		return
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -62,6 +72,7 @@ Usage:
   apple-sandbox ls                         List sandbox sessions
   apple-sandbox stop <session-id>          Stop a session
   apple-sandbox rm <session-id>            Force-remove a session
+  apple-sandbox version                    Print version info
 `)
 }
 

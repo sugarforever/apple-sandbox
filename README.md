@@ -46,11 +46,25 @@ from your own app's session-creation call).
 - Apple Silicon Mac, macOS with Apple `container` installed
   (`brew install --cask container`) and its services started
   (`container system start`).
-- Go 1.27+ to build the CLI.
 
 Run `apple-sandbox doctor` to check all of the above plus free disk space.
 
-## Build
+## Install
+
+Download the latest `darwin_arm64` release from
+[Releases](https://github.com/sugarforever/apple-sandbox/releases) (there's
+nothing else to build for — Apple `container` doesn't run on any other
+platform):
+
+```bash
+curl -sL "https://api.github.com/repos/sugarforever/apple-sandbox/releases/latest" \
+  | grep -o '"browser_download_url": *"[^"]*darwin_arm64\.tar\.gz"' \
+  | cut -d '"' -f4 \
+  | xargs curl -sL \
+  | tar xz -C /usr/local/bin apple-sandbox
+```
+
+Or build from source (needs Go 1.27+):
 
 ```bash
 go build -o bin/apple-sandbox ./cmd/apple-sandbox
@@ -244,3 +258,23 @@ apple-sandbox run
 No daemon, no control-plane process: `apple-sandbox` shells out to the
 `container` CLI directly, and the container survives (not `--rm`) after
 stopping so `logs` remains available for debugging a crashed executor.
+
+## Releasing
+
+Releases are built by [GoReleaser](https://goreleaser.com/) via
+[`.github/workflows/release.yml`](.github/workflows/release.yml), triggered
+by pushing a semver tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+That produces a GitHub Release with the `darwin_arm64` archive, a
+`checksums.txt`, and an auto-generated changelog (grouped by
+`feat:`/`fix:` commit prefixes). [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
+runs `gofmt`, `go vet`, `go build`, and a GoReleaser snapshot build (no
+publish) on every push/PR to `main`, so a broken release config fails CI
+before it ever fails a real tag push.
+
+To dry-run a release locally: `goreleaser release --snapshot --clean --skip=publish`.

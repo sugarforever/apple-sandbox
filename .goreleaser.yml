@@ -1,0 +1,67 @@
+version: 2
+
+project_name: apple-sandbox
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: apple-sandbox
+    main: ./cmd/apple-sandbox
+    binary: apple-sandbox
+    # Apple `container` itself only runs on Apple Silicon macOS, so a
+    # binary for any other platform would be dead on arrival.
+    goos:
+      - darwin
+    goarch:
+      - arm64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: apple-sandbox
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+      - image/executor/Dockerfile
+      - image/executor/entrypoint.sh
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: Bug fixes
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^ci:'
+
+release:
+  github:
+    owner: sugarforever
+    name: apple-sandbox
+  header: |
+    macOS/Apple Silicon only — Apple `container` does not run on any other
+    platform. See the README for prerequisites and setup.
+  footer: |
+    **Full Changelog**: https://github.com/sugarforever/apple-sandbox/compare/{{ .PreviousTag }}...{{ .Tag }}
+  prerelease: auto
