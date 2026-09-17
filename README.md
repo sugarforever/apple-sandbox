@@ -178,9 +178,15 @@ Files work the same way this whole CLI does: `/workspace` is a bind mount,
 so an input CSV just needs to be dropped into
 `./sandboxes/<session-id>/` on the host, and an output file the agent writes
 (e.g. to `/workspace/outputs/`) appears there immediately — no upload or
-download API call in either direction. (Self-hosted artifacts are
-explicitly *not* published through OpenAI's Artifacts API — that's
-hosted-environment-only. See the [self-hosted sandboxes guide](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted).)
+download API call in either direction. This isn't just the simplest option,
+it's the *only* one: `openai_hosted` sessions accept an inline
+`environment.files: [{type: "inline", path, data: base64}]` array at
+creation time, but sending that same field on a `self_hosted` session gets
+a real `400 Unknown parameter: 'environment.files'` — OpenAI rejects it at
+the schema level, it's not just undocumented. (Output artifacts are
+similarly hosted-only: self-hosted artifacts are explicitly *not* published
+through OpenAI's Artifacts API. See the
+[self-hosted sandboxes guide](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted).)
 
 ### Provisioning modes: this CLI is "application-managed," on purpose
 
