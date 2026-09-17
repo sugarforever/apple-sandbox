@@ -50,6 +50,23 @@ session** — not just the local container lifecycle:
   - The bind mount is confirmed live/real-time in both directions: a file
     written on the host with a plain `cat >` appeared instantly via
     `container exec ... cat /workspace/...`, no restart needed.
+- **The `v0.1.1` release itself was re-verified the way an actual user would
+  use it**: `curl`-installed via the exact command in
+  [Install](#install) into `~/.local/bin` (no `sudo`, no repo checkout),
+  then `doctor` / `build` / `run` / the full CSV round trip all run from an
+  empty directory. This caught a real bug that shipped in `v0.1.0`:
+  `apple-sandbox build` defaulted to a relative `image/executor` path that
+  only exists inside a repo checkout, so a binary-only install couldn't
+  build the image at all. Fixed in `v0.1.1` by embedding the Dockerfile and
+  entrypoint script into the binary via `go:embed`.
+- **One real data point on task reliability, not glossed over**: re-running
+  the exact same CSV task against `v0.1.1` succeeded on the *second*
+  submission, not the first — the first turn consumed real tokens (per the
+  session's `usage` field) but wrote no output file, for reasons outside
+  apple-sandbox's visibility (the container stayed `running`/connected the
+  whole time; nothing here crashed or reconnected). Resubmitting the same
+  input to the same still-open session produced the correct file on the
+  next turn. Not yet enough runs to know how often this happens.
 
 ### Known gaps (not in this MVP)
 
@@ -89,12 +106,19 @@ nothing else to build for — Apple `container` doesn't run on any other
 platform):
 
 ```bash
+mkdir -p ~/.local/bin
 curl -sL "https://api.github.com/repos/sugarforever/apple-sandbox/releases/latest" \
   | grep -o '"browser_download_url": *"[^"]*darwin_arm64\.tar\.gz"' \
   | cut -d '"' -f4 \
   | xargs curl -sL \
-  | tar xz -C /usr/local/bin apple-sandbox
+  | tar xz -C ~/.local/bin apple-sandbox
 ```
+
+Make sure `~/.local/bin` is on `PATH` (add `export PATH="$HOME/.local/bin:$PATH"`
+to your shell profile if `apple-sandbox version` doesn't resolve). This
+installs without `sudo`; `/usr/local/bin` is a common alternative but often
+isn't user-writable without it — `~/.local/bin` avoided that entirely in
+testing.
 
 Or build from source (needs Go 1.27+):
 
@@ -262,31 +286,35 @@ itself already reports as `stopped`.
 
 ## Usage
 
+Assumes `apple-sandbox` is installed per [Install](#install) above (i.e. on
+`PATH`). If you built from source instead, use `./bin/apple-sandbox`.
+
 ```bash
 # 1. Check the environment
-./bin/apple-sandbox doctor
+apple-sandbox doctor
 
-# 2. Build the executor image (Node + codex)
-./bin/apple-sandbox build
+# 2. Build the executor image (Node + codex) — works from any directory,
+#    the Dockerfile is embedded in the binary, no repo checkout needed
+apple-sandbox build
 
 # 3. Start a session (environment-id / remote-url / executor key come from
 #    the Integrating section above)
 export OPENAI_EXECUTOR_API_KEY=<restricted key>
-./bin/apple-sandbox run \
+apple-sandbox run \
   --environment-id env_xxx \
   --remote-url https://<agents-api-remote-url>
 
 # 4. Watch it
-./bin/apple-sandbox logs -f <session-id>
+apple-sandbox logs -f <session-id>
 
 # 5. List / stop / remove
-./bin/apple-sandbox ls
-./bin/apple-sandbox stop <session-id>
-./bin/apple-sandbox rm <session-id>
+apple-sandbox ls
+apple-sandbox stop <session-id>
+apple-sandbox rm <session-id>
 
 # 6. Or clean up everything already stopped and old enough, instead of
 #    tracking individual session ids
-./bin/apple-sandbox prune --older-than 1h
+apple-sandbox prune --older-than 1h
 ```
 
 Each session's `/workspace` is a bind mount of
@@ -297,8 +325,13 @@ state; the container itself is disposable (`rm` after `stop`).
 
 This is the actual sequence that produced the result below — a real
 session, a real `apple-sandbox run`, a real output file — not a
-hypothetical. IDs are redacted (`<...>`); everything else is copy-pasteable.
-See [Status](#status) for what broke the first two times this was run.
+hypothetical, and re-verified against the actual `v0.1.1` release binary
+(`curl`-installed per [Install](#install), no repo checkout on disk). IDs
+are redacted (`<...>`); everything else is copy-pasteable. See
+[Status](#status) for what broke along the way — including a case where
+the first task submission silently produced no file and a resubmission was
+needed, which is worth knowing about before assuming step 5 below will
+always work on the first try.
 
 ### 1. Create the session
 
