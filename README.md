@@ -7,7 +7,8 @@ Virtualization.framework VM.
 
 ## Status
 
-MVP. Verified so far:
+MVP, but **the full round trip is verified against a real, live Agents API
+session** — not just the local container lifecycle:
 
 - `run` → `ls` → `logs` → `stop` → `rm` lifecycle works end-to-end against
   Apple `container` on this machine.
@@ -15,31 +16,40 @@ MVP. Verified so far:
   `--older-than`, tested against a real stopped session (verified via
   `container inspect`'s `startedDate`, which is a Cocoa reference-date
   timestamp — seconds since 2001-01-01T00:00:00Z, not Unix epoch).
-- **Tested against a real, live Agents API session** (real `POST
-  /v1/agents/sessions` call, real `environment.id` / `remote_url`). Two real
-  bugs surfaced this way that no amount of reading docs would have caught:
+- **End-to-end CSV task, run for real**: created a real self-hosted session
+  (`POST /v1/agents/sessions`), started `apple-sandbox run` with a properly
+  `api.agents.environments.connect`-scoped key, dropped a CSV into the
+  bind-mounted workspace, submitted "analyze this CSV and write summary
+  stats to `/workspace/outputs/summary.json`" via the Agents API, and the
+  file showed up in `./sandboxes/<session-id>/outputs/summary.json` on the
+  host — `{"rows": 4, "total": 75, "verified": true}`, matching the agent's
+  own reported output exactly. Session went `idle → in_progress → idle`;
+  torn down cleanly afterward (`apple-sandbox stop/rm` + `DELETE
+  /v1/agents/sessions/{id}`).
+- That first successful run followed two failed attempts that each surfaced
+  a real, previously-undocumented bug:
   - The executor image (`node:22-slim`) shipped without a usable CA trust
     store, so outbound TLS to `api.openai.com` failed with "unable to get
     local issuer certificate." Fixed by installing `ca-certificates` in the
     [Dockerfile](image/executor/Dockerfile).
+  - The Agents API event type for submitting input is
+    `agent.session.input.message`, not `session.input.message` as earlier
+    research (and an earlier version of this README) had it — confirmed by
+    a real `400 invalid_request_error` naming the three actually-supported
+    values.
   - `session.environment.remote_url` is an `https://api.openai.com/...`
     URL, not `wss://codex-cloud-environments.chatgpt.com` as earlier
-    research assumed — `codex exec-server` connected to it fine once TLS was
-    fixed. (Whether `codex-cloud-environments.chatgpt.com` is still used for
-    anything *after* registration is unconfirmed either way — see
-    [Known gaps](#known-gaps-not-in-this-mvp).)
-  - With TLS fixed, registration reached OpenAI and failed with a real,
-    correctly-formed error: `403 Forbidden: missing required scope
-    api.agents.environments.connect`. This is the server actually enforcing
-    the scope requirement described in
-    [Integrating with the OpenAI Agents API](#integrating-with-the-openai-agents-api) —
-    a regular project `OPENAI_API_KEY` doesn't have it, only a purpose-made
-    restricted key does.
-
-Not yet verified: a full round trip — submitting a task, the executor
-actually running it, and a result file appearing in the workspace — because
-that needs a real `api.agents.environments.connect`-scoped key, which is
-created by hand in the OpenAI Platform UI, not something tested so far.
+    research assumed. Whether `codex-cloud-environments.chatgpt.com` is used
+    for anything else is still unconfirmed — see
+    [Known gaps](#known-gaps-not-in-this-mvp).
+  - A regular project `OPENAI_API_KEY` used as the executor key fails
+    registration with a real `403 Forbidden: missing required scope
+    api.agents.environments.connect` — the scope requirement in
+    [Integrating with the OpenAI Agents API](#integrating-with-the-openai-agents-api)
+    is server-enforced, not just documented practice.
+  - The bind mount is confirmed live/real-time in both directions: a file
+    written on the host with a plain `cat >` appeared instantly via
+    `container exec ... cat /workspace/...`, no restart needed.
 
 ### Known gaps (not in this MVP)
 
@@ -62,11 +72,6 @@ created by hand in the OpenAI Platform UI, not something tested so far.
   [Integrating with the OpenAI Agents API](#integrating-with-the-openai-agents-api)
   for why this — rather than a webhook receiver — is the right amount of
   automation for this CLI's provisioning mode.
-- **`CODEX_API_KEY` as the container env var is confirmed** — a real
-  `codex exec-server` run picked it up and used it to attempt registration
-  (it got as far as a real 403 from OpenAI over the scope, not an "unset
-  env var" error). See the comment in
-  [`image/executor/entrypoint.sh`](image/executor/entrypoint.sh).
 
 ## Prerequisites
 
@@ -155,16 +160,27 @@ apple-sandbox run \
   --executor-key <restricted key from step 2>
 ```
 
-Session input goes through the Agents API itself, not through this CLI:
+Session input goes through the Agents API itself, not through this CLI —
+this exact call, `agent.session.input.message` included, is what actually
+worked in the CSV test above (`session.input.message` gets a `400`):
 
 ```bash
 curl https://api.openai.com/v1/agents/sessions/$SESSION_ID/events \
   --request POST \
   --header "OpenAI-Beta: agents=v1" \
   --header "Authorization: Bearer $OPENAI_API_KEY" \
-  --json '{"events": [{"type": "session.input.message",
+  --header "Content-Type: application/json" \
+  --data '{"events": [{"type": "agent.session.input.message",
     "input": [{"role": "user", "content": [{"type": "input_text", "text": "..."}]}]}]}'
 ```
+
+Files work the same way this whole CLI does: `/workspace` is a bind mount,
+so an input CSV just needs to be dropped into
+`./sandboxes/<session-id>/` on the host, and an output file the agent writes
+(e.g. to `/workspace/outputs/`) appears there immediately — no upload or
+download API call in either direction. (Self-hosted artifacts are
+explicitly *not* published through OpenAI's Artifacts API — that's
+hosted-environment-only. See the [self-hosted sandboxes guide](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted).)
 
 ### Provisioning modes: this CLI is "application-managed," on purpose
 
@@ -315,14 +331,18 @@ Two things worth noting from that diagram:
 
 ### Session lifecycle
 
-The states the sandbox itself moves through. `Created → Registering →
-Rejected → Stopped` is the one path actually triggered end-to-end (with a
-bogus `--remote-url`; the rejection surfaced verbatim through `apple-sandbox
-logs`, see [Status](#status)). `Connected → Stopped` — the executor exiting
-on its own once OpenAI closes the session for good — is inferred from
-OpenAI's docs ("the executor reconnects if the connection drops," implying
-it doesn't when the drop is final), not yet observed against a live session;
-`prune`'s safety depends on that inference holding.
+The states the sandbox itself moves through. Two paths are now confirmed
+end-to-end, not just read about: `Created → Registering → Rejected →
+Stopped` (a bogus `--remote-url`, rejection surfaced verbatim through
+`apple-sandbox logs`) and `Created → Registering → Connected → Executing →
+Connected` (a real CSV analysis task, dispatched and completed — see
+[Status](#status)). What's still *not* directly observed is the `Connected
+→ Stopped` transition specifically — the executor exiting on its own once
+OpenAI closes the session for good, rather than being stopped by hand. Our
+CSV test ended with `apple-sandbox stop` after the session went `idle`, not
+by watching the container exit on its own. `prune`'s safety still rests on
+that one inference from OpenAI's docs ("the executor reconnects if the
+connection drops," implying it doesn't when the drop is final) holding.
 
 ```mermaid
 stateDiagram-v2
