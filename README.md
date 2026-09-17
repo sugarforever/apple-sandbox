@@ -156,6 +156,32 @@ Vercel, Modal) documents both as a deliberate choice, not a fallback:
 | **Application-managed** | Your app starts compute itself, synchronously, right when it creates the session | No |
 | **Webhook-managed** | OpenAI pushes `agent.session.*` events to a handler you deploy, which starts/reconnects compute on demand | Yes — OpenAI has to reach your endpoint |
 
+`apple-sandbox` implements the left column — see the full sequence in
+[How it works](#how-it-works) below. The right column is what you'd build
+*instead*, not something this CLI is missing; shown here only for contrast,
+since it's the shape of Cloudflare's/Vercel's/Modal's reference
+implementations:
+
+```mermaid
+sequenceDiagram
+    actor App as Your app
+    participant Agents as OpenAI Agents API
+    participant Hook as Your webhook handler<br/>(public URL — not part of this CLI)
+    participant VM as Sandbox VM
+
+    App->>Agents: Create session (environment.type = self_hosted)
+    Note over Agents,Hook: OpenAI now decides when compute starts
+    Agents->>Hook: agent.session.created
+    Hook->>VM: Prewarm (e.g. pull image)
+    Agents->>Hook: agent.session.action_required
+    Hook->>Hook: Confirm ownership,<br/>read environment.id / remote_url
+    Hook->>VM: Start executor (container run + codex exec-server)
+    Agents->>Hook: agent.session.idle
+    Hook->>VM: Snapshot if supported, arm shutdown deadline
+    Agents->>Hook: agent.session.failed
+    Hook->>VM: Stop + clean up
+```
+
 `apple-sandbox run` is a straightforward implementation of **application-managed**
 provisioning: your app creates the session, gets `environment.id` /
 `remote_url` back, and calls `apple-sandbox run` right then. That's the
@@ -264,6 +290,40 @@ Two things worth noting from that diagram:
   to `https://api.openai.com` and `wss://codex-cloud-environments.chatgpt.com`.
   As noted in [Known gaps](#known-gaps-not-in-this-mvp), this sandbox doesn't
   yet restrict egress to just those two hosts.
+
+### Session lifecycle
+
+The states the sandbox itself moves through. `Created → Registering →
+Rejected → Stopped` is the one path actually triggered end-to-end (with a
+bogus `--remote-url`; the rejection surfaced verbatim through `apple-sandbox
+logs`, see [Status](#status)). `Connected → Stopped` — the executor exiting
+on its own once OpenAI closes the session for good — is inferred from
+OpenAI's docs ("the executor reconnects if the connection drops," implying
+it doesn't when the drop is final), not yet observed against a live session;
+`prune`'s safety depends on that inference holding.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Created : apple-sandbox run
+    Created --> Registering : entrypoint.sh starts codex exec-server
+    Registering --> Rejected : bad --remote-url or key<br/>(verified: exec-server rejects immediately)
+    Registering --> Connected : WebSocket registration accepted
+    Connected --> Executing : Harness dispatches a command
+    Executing --> Connected : result returned
+    Connected --> Reconnecting : WebSocket drops
+    Reconnecting --> Connected : reconnect succeeds
+    Connected --> Stopped : OpenAI closes the session for good<br/>(executor exits on its own)
+    Rejected --> Stopped
+    Stopped --> Removed : apple-sandbox rm
+    Stopped --> Removed : apple-sandbox prune --older-than ttl
+    Removed --> [*]
+```
+
+`Reconnecting` is handled entirely inside `codex exec-server` — it's the
+executor's own outbound WebSocket retrying, not anything `apple-sandbox`
+does. From the CLI's point of view a session is only ever `running` or
+`stopped` (what `apple-sandbox ls` reports); everything between `Created`
+and `Stopped` happens inside the VM.
 
 ### Local CLI mechanics
 
