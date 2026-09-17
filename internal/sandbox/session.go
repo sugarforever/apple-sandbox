@@ -20,6 +20,14 @@ import (
 // on `container list`'s lack of label filtering.
 const NamePrefix = "apple-sandbox-"
 
+// ExecutorKeyEnvVar is the one name this whole tool uses for the restricted
+// executor key, on the host and inside the container alike — matching
+// Cloudflare's reference integration's Worker-secret name. codex exec-server
+// itself only reads CODEX_API_KEY (not our choice to make), so entrypoint.sh
+// aliases ExecutorKeyEnvVar to CODEX_API_KEY internally; nothing outside the
+// container image needs to know that name exists.
+const ExecutorKeyEnvVar = "OPENAI_EXECUTOR_API_KEY"
+
 var invalidNameChars = regexp.MustCompile(`[^a-zA-Z0-9_.-]`)
 
 // NewSessionID generates a short random id, or sanitizes a caller-supplied
@@ -71,7 +79,7 @@ func Start(opts Options) (*Result, error) {
 	}
 
 	env := map[string]string{
-		"CODEX_API_KEY":         opts.ExecutorKey,
+		ExecutorKeyEnvVar:       opts.ExecutorKey,
 		"OPENAI_ENVIRONMENT_ID": opts.EnvironmentID,
 		"OPENAI_REMOTE_URL":     opts.RemoteURL,
 	}

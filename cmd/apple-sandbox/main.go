@@ -113,7 +113,7 @@ func runRun(args []string) error {
 	workspaceRoot := fs.String("workspace-root", "./sandboxes", "parent directory for per-session workspace dirs")
 	environmentID := fs.String("environment-id", "", "Agents API session.environment.id (required)")
 	remoteURL := fs.String("remote-url", "", "Agents API session.environment.remote_url (required)")
-	executorKey := fs.String("executor-key", "", "restricted, environment-scoped CODEX_API_KEY (required)")
+	executorKey := fs.String("executor-key", "", "restricted, environment-scoped executor key; defaults to $"+sandbox.ExecutorKeyEnvVar)
 	cpus := fs.String("cpus", "2", "CPUs allocated to the sandbox VM")
 	memory := fs.String("memory", "2G", "memory allocated to the sandbox VM")
 	network := fs.String("network", "", "container network name (optional)")
@@ -121,8 +121,11 @@ func runRun(args []string) error {
 		return err
 	}
 
+	if *executorKey == "" {
+		*executorKey = os.Getenv(sandbox.ExecutorKeyEnvVar)
+	}
 	if *environmentID == "" || *remoteURL == "" || *executorKey == "" {
-		return fmt.Errorf("--environment-id, --remote-url and --executor-key are required")
+		return fmt.Errorf("--environment-id and --remote-url are required, and --executor-key or $%s must be set", sandbox.ExecutorKeyEnvVar)
 	}
 
 	sessionID, err := sandbox.NewSessionID(*sessionHint)

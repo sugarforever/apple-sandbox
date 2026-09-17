@@ -145,19 +145,25 @@ From the OpenAI Platform, create a key scoped to exactly:
 - `api.model.read`
 - `api.agents.environments.connect`
 
-Nothing else. This becomes `--executor-key` — the container's `CODEX_API_KEY`
-— and must never be your app's own `OPENAI_API_KEY`. This isn't a
+Nothing else, and never your app's own `OPENAI_API_KEY`. This isn't a
 recommendation to be careful with, it's an enforced check: registering with
 a regular project `OPENAI_API_KEY` gets a real `403 Forbidden: missing
 required scope api.agents.environments.connect` from OpenAI.
 
+Export it as `OPENAI_EXECUTOR_API_KEY` — the one name this whole tool uses
+for this key, on the host and inside the container alike (matching
+Cloudflare's reference integration's Worker-secret name for the same
+value). `--executor-key` exists as an explicit override, but putting a
+secret in a CLI flag leaves it in shell history and `ps` output, so the env
+var is the one to actually use.
+
 ### 3. Start the sandbox, then drive the session normally
 
 ```bash
+export OPENAI_EXECUTOR_API_KEY=<restricted key from step 2>
 apple-sandbox run \
   --environment-id <environment.id from step 1> \
-  --remote-url <environment.remote_url from step 1> \
-  --executor-key <restricted key from step 2>
+  --remote-url <environment.remote_url from step 1>
 ```
 
 Session input goes through the Agents API itself, not through this CLI —
@@ -263,12 +269,12 @@ itself already reports as `stopped`.
 # 2. Build the executor image (Node + codex)
 ./bin/apple-sandbox build
 
-# 3. Start a session (environment-id / remote-url / executor-key come from
+# 3. Start a session (environment-id / remote-url / executor key come from
 #    the Integrating section above)
+export OPENAI_EXECUTOR_API_KEY=<restricted key>
 ./bin/apple-sandbox run \
   --environment-id env_xxx \
-  --remote-url https://<agents-api-remote-url> \
-  --executor-key <restricted-CODEX_API_KEY>
+  --remote-url https://<agents-api-remote-url>
 
 # 4. Watch it
 ./bin/apple-sandbox logs -f <session-id>
@@ -304,10 +310,10 @@ sequenceDiagram
 
     App->>Agents: 1. Create session (environment.type = self_hosted)
     Agents-->>App: 2. session.environment.id + environment.remote_url
-    App->>App: 3. Issue a restricted, environment-scoped CODEX_API_KEY<br/>(scopes: api.model.read + api.agents.environments.connect, nothing else)
-    App->>CLI: 4. apple-sandbox run --environment-id --remote-url --executor-key
+    App->>App: 3. Issue a restricted, environment-scoped key<br/>(scopes: api.model.read + api.agents.environments.connect, nothing else)
+    App->>CLI: 4. OPENAI_EXECUTOR_API_KEY=... apple-sandbox run --environment-id --remote-url
     CLI->>VM: 5. container run -d (bind-mount ./sandboxes/<id> → /workspace, inject env vars)
-    VM->>VM: 6. entrypoint.sh → codex exec-server --remote <url> --environment-id <id>
+    VM->>VM: 6. entrypoint.sh aliases OPENAI_EXECUTOR_API_KEY → CODEX_API_KEY, runs codex exec-server --remote <url> --environment-id <id>
     VM->>Harness: 7. Outbound WebSocket registration, authenticated with CODEX_API_KEY
     Harness-->>Agents: 8. Session marked active
     Agents-->>App: 9. SSE session events (in_progress / action_required / idle)
@@ -382,10 +388,11 @@ apple-sandbox run
   → creates ./sandboxes/<session-id>/ (host dir, bind-mounted to /workspace)
   → container run -d --name apple-sandbox-<session-id> \
       -v <workspace>:/workspace \
-      -e CODEX_API_KEY=... -e OPENAI_ENVIRONMENT_ID=... -e OPENAI_REMOTE_URL=... \
+      -e OPENAI_EXECUTOR_API_KEY=... -e OPENAI_ENVIRONMENT_ID=... -e OPENAI_REMOTE_URL=... \
       apple-sandbox-executor:latest
-       → entrypoint.sh → codex exec-server --remote ... --environment-id ...
-            → outbound WebSocket to OpenAI's hosted harness
+       → entrypoint.sh: export CODEX_API_KEY="$OPENAI_EXECUTOR_API_KEY" (codex exec-server's own required name)
+            → codex exec-server --remote ... --environment-id ...
+                 → outbound WebSocket to OpenAI's hosted harness
 ```
 
 No daemon, no control-plane process: `apple-sandbox` shells out to the
